@@ -1,6 +1,6 @@
 {
 	"name": "obsidian-daily-to-calendar",
-	"version": "1.0.0",
+	"version": "1.1.0",
 	"description": "Plugin to sync daily notes schedule with Google Calendar",
 	"main": "main.js",
 	"scripts": {
@@ -19,7 +19,6 @@
 		"esbuild": "0.17.3",
 		"obsidian": "latest",
 		"tslib": "2.4.0",
-		"typescript": "4.7.4",
-		"googleapis": "^132.0.0"
+		"typescript": "4.7.4"
 	}
 }

@@ -1,0 +1,58 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - '*.*.*'
+  workflow_dispatch:
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Verify tag matches manifest.json version
+        id: verify
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          # Expect tags in form 1.2.3 (no leading v)
+          VERSION_FROM_TAG="$TAG"
+          VERSION_FROM_MANIFEST=$(jq -r .version manifest.json)
+          echo "Tag: $TAG"
+          echo "Manifest: $VERSION_FROM_MANIFEST"
+          if [ "$VERSION_FROM_TAG" != "$VERSION_FROM_MANIFEST" ]; then
+            echo "::error::Tag ($VERSION_FROM_TAG) does not match manifest.json version ($VERSION_FROM_MANIFEST)"
+            exit 1
+          fi
+          echo "version=$VERSION_FROM_MANIFEST" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ steps.verify.outputs.version }}
+          body: |
+            Automated release for version ${{ steps.verify.outputs.version }}.
+          draft: false
+          prerelease: false
+          files: |
+            main.js
+            manifest.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

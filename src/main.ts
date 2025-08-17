@@ -1,7 +1,4 @@
 import { App, Notice, Plugin, PluginSettingTab, Setting, TFile, TFolder, moment } from 'obsidian';
-// eslint-disable-next-line @typescript-eslint/ban-ts-comment
-// @ts-ignore
-import { google } from 'googleapis';
 
 import { DEFAULT_SETTINGS, ScheduleGCalSettings } from 'src/settings';
 
@@ -141,7 +138,7 @@ export default class ScheduleGCalPlugin extends Plugin {
 
     this.updateStatus('Preparing…');
     try {
-      await getCalendarAndAuth(this.settings);
+      await getAccessTokenMobile(this.settings);
     } catch (e) {
       console.error('Auth init failed', e);
       new Notice('Google auth failed — check settings');
@@ -356,9 +353,9 @@ function buildEventBody(entry: ScheduleEntry, ymd: string, timeZone: string, not
   } as any;
 }
 
-let cachedJwt: any | null = null;
-let cachedCal: any | null = null;
-let cachedKey: string | null = null;
+// ===== REST auth helpers (Service Account JWT) =====
+// Token cache for REST flow
+let mobileTokenCache: { key: string; accessToken: string; expEpoch: number } | null = null;
 
 function authCacheKey(s: ScheduleGCalSettings): string {
   const scopes = 'https://www.googleapis.com/auth/calendar';
@@ -366,45 +363,152 @@ function authCacheKey(s: ScheduleGCalSettings): string {
   return `${s.saClientEmail}|${scopes}|${keyLen}`;
 }
 
-async function getCalendarAndAuth(settings: ScheduleGCalSettings) {
-  const key = authCacheKey(settings);
-  if (cachedCal && cachedJwt && cachedKey === key) {
-    return { cal: cachedCal, jwt: cachedJwt };
-  }
-  const jwt = new (google.auth as any).JWT({
-    email: settings.saClientEmail,
-    key: settings.saPrivateKey,
-    scopes: 'https://www.googleapis.com/auth/calendar',
-  });
-  const cal = google.calendar({ version: 'v3', auth: jwt });
-  cachedJwt = jwt;
-  cachedCal = cal;
-  cachedKey = key;
-  return { cal, jwt };
+function base64UrlEncode(buf: ArrayBuffer | Uint8Array): string {
+  const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+  let str = '';
+  for (let i = 0; i < bytes.length; i++) str += String.fromCharCode(bytes[i]);
+  return btoa(str).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
 }
 
-function isAuthError(err: any): boolean {
-  const code = err?.code ?? err?.response?.status;
-  return code === 401 || code === 403;
+function base64UrlEncodeStr(s: string): string {
+  return btoa(unescape(encodeURIComponent(s))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
 }
+
+function pemToPkcs8ArrayBuffer(pem: string): ArrayBuffer {
+  const cleaned = pem.replace(/-----BEGIN PRIVATE KEY-----/g, '')
+    .replace(/-----END PRIVATE KEY-----/g, '')
+    .replace(/\r|\n|\s/g, '');
+  const binary = atob(cleaned);
+  const len = binary.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes.buffer;
+}
+
+async function importPrivateKeyRS256(pem: string): Promise<CryptoKey> {
+  const keyData = pemToPkcs8ArrayBuffer(pem);
+  return await crypto.subtle.importKey(
+    'pkcs8',
+    keyData,
+    { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+}
+
+async function signJwtRS256(header: Record<string, any>, payload: Record<string, any>, pem: string): Promise<string> {
+  const enc = new TextEncoder();
+  const headerB64 = base64UrlEncodeStr(JSON.stringify(header));
+  const payloadB64 = base64UrlEncodeStr(JSON.stringify(payload));
+  const toSign = `${headerB64}.${payloadB64}`;
+  const key = await importPrivateKeyRS256(pem);
+  const signature = await crypto.subtle.sign(
+    { name: 'RSASSA-PKCS1-v1_5' },
+    key,
+    enc.encode(toSign)
+  );
+  const sigB64 = base64UrlEncode(signature);
+  return `${toSign}.${sigB64}`;
+}
+
+async function getAccessTokenMobile(settings: ScheduleGCalSettings): Promise<string> {
+  const key = authCacheKey(settings);
+  const now = Math.floor(Date.now() / 1000);
+  if (mobileTokenCache && mobileTokenCache.key === key && mobileTokenCache.expEpoch - 60 > now) {
+    return mobileTokenCache.accessToken;
+  }
+  const iat = now;
+  const exp = now + 3600;
+  const header = { alg: 'RS256', typ: 'JWT' };
+  const payload = {
+    iss: settings.saClientEmail,
+    scope: 'https://www.googleapis.com/auth/calendar',
+    aud: 'https://oauth2.googleapis.com/token',
+    iat,
+    exp,
+  } as const;
+  const assertion = await signJwtRS256(header, payload, settings.saPrivateKey);
+  const form = new URLSearchParams();
+  form.set('grant_type', 'urn:ietf:params:oauth:grant-type:jwt-bearer');
+  form.set('assertion', assertion);
+  const resp = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: form.toString(),
+  });
+  if (!resp.ok) {
+    const txt = await resp.text().catch(() => '');
+    throw new Error(`Token exchange failed: ${resp.status} ${txt}`);
+  }
+  const data = await resp.json();
+  const accessToken = data.access_token as string;
+  const expiresIn = (data.expires_in as number) || 3600;
+  mobileTokenCache = { key, accessToken, expEpoch: now + expiresIn };
+  return accessToken;
+}
+
+async function gcalFetchMobile(settings: ScheduleGCalSettings, url: string, init: RequestInit): Promise<any> {
+  const token = await getAccessTokenMobile(settings);
+  const resp = await fetch(url, {
+    ...init,
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'Content-Type': 'application/json',
+      ...(init.headers || {}),
+    },
+  });
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => '');
+    throw new Error(`GCal REST error ${resp.status}: ${text}`);
+  }
+  if (resp.status === 204) return undefined;
+  return await resp.json();
+}
+
+async function createEventViaRest(
+  settings: ScheduleGCalSettings,
+  calendarId: string,
+  body: any,
+) {
+  const url = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events`;
+  return await gcalFetchMobile(settings, url, { method: 'POST', body: JSON.stringify(body) });
+}
+
+async function patchEventViaRest(
+  settings: ScheduleGCalSettings,
+  calendarId: string,
+  eventId: string,
+  body: any,
+) {
+  const url = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`;
+  return await gcalFetchMobile(settings, url, { method: 'PATCH', body: JSON.stringify(body) });
+}
+
+async function deleteEventViaRest(
+  settings: ScheduleGCalSettings,
+  calendarId: string,
+  eventId: string,
+): Promise<void> {
+  const url = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`;
+  const token = await getAccessTokenMobile(settings);
+  const resp = await fetch(url, {
+    method: 'DELETE',
+    headers: { 'Authorization': `Bearer ${token}` },
+  });
+  if (resp.ok || resp.status === 204 || resp.status === 404 || resp.status === 410) {
+    return;
+  }
+  const text = await resp.text().catch(() => '');
+  throw new Error(`GCal REST error ${resp.status}: ${text}`);
+}
+
 
 async function createEventViaClient(
   settings: ScheduleGCalSettings,
   calendarId: string,
   body: any
 ) {
-  const { cal, jwt } = await getCalendarAndAuth(settings);
-  try {
-    const { data } = await cal.events.insert({ calendarId, requestBody: body });
-    return data;
-  } catch (e: any) {
-    if (isAuthError(e)) {
-      await jwt.authorize().catch(() => { });
-      const { data } = await cal.events.insert({ calendarId, requestBody: body });
-      return data;
-    }
-    throw e;
-  }
+  return await createEventViaRest(settings, calendarId, body);
 }
 
 async function patchEventViaClient(
@@ -413,18 +517,7 @@ async function patchEventViaClient(
   eventId: string,
   body: any
 ) {
-  const { cal, jwt } = await getCalendarAndAuth(settings);
-  try {
-    const { data } = await cal.events.patch({ calendarId, eventId, requestBody: body });
-    return data;
-  } catch (e: any) {
-    if (isAuthError(e)) {
-      await jwt.authorize().catch(() => { });
-      const { data } = await cal.events.patch({ calendarId, eventId, requestBody: body });
-      return data;
-    }
-    throw e;
-  }
+  return await patchEventViaRest(settings, calendarId, eventId, body);
 }
 
 async function deleteEventViaClient(
@@ -432,17 +525,7 @@ async function deleteEventViaClient(
   calendarId: string,
   eventId: string
 ): Promise<void> {
-  const { cal, jwt } = await getCalendarAndAuth(settings);
-  try {
-    await cal.events.delete({ calendarId, eventId });
-  } catch (e: any) {
-    if (isAuthError(e)) {
-      await jwt.authorize().catch(() => { });
-      await cal.events.delete({ calendarId, eventId });
-      return;
-    }
-    throw e;
-  }
+  await deleteEventViaRest(settings, calendarId, eventId);
 }
 
 
