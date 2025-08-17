@@ -1,5 +1,7 @@
 # Obsidian Daily to Calendar
 
+ [Русская версия README](./README.ru.md)
+
 A plugin that automatically syncs your daily notes schedule with Google Calendar, keeping your Obsidian planning in sync with your calendar events.
 
 ## Features

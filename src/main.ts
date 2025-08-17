@@ -502,7 +502,7 @@ class ScheduleGCalSettingTab extends PluginSettingTab {
 
     const saHelp = containerEl.createEl('div');
     saHelp.setAttr('style', 'font-size: 13px; font-weight: 600; color: var(--text-accent); padding: 8px 10px; border-left: 3px solid var(--interactive-accent); border-radius: 4px; margin-top: 8px;');
-    saHelp.setText('Tip: Share the target calendar with the service account email with at least "Make changes to events". For Workspace-wide use, configure domain-wide delegation and set an impersonation user.');
+    saHelp.setText('Tip: Share the target calendar with the service account email with at least "Make changes to events".');
     new Setting(containerEl)
       .setName('Service Account Client Email')
       .setDesc('From the JSON key: client_email')
