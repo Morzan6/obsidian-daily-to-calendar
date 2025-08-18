@@ -181,4 +181,4 @@ If you find this plugin helpful, consider supporting its development:
 ---
 
 **Author**: Morzan6 (n.kusmaul@yandex.ru)  
-**Version**: 1.0.0
+**Version**: 1.1.1

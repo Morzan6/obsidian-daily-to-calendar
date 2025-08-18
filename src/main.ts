@@ -1,4 +1,4 @@
-import { App, Notice, Plugin, PluginSettingTab, Setting, TFile, TFolder, moment } from 'obsidian';
+import { App, Notice, Plugin, PluginSettingTab, Setting, TFile, TFolder, moment, requestUrl, TextAreaComponent } from 'obsidian';
 
 import { DEFAULT_SETTINGS, ScheduleGCalSettings } from 'src/settings';
 
@@ -132,7 +132,9 @@ export default class ScheduleGCalPlugin extends Plugin {
       const normalized = extractScheduleNormalized(content, this.settings.scheduleHeading);
       const h = simpleHash(normalized);
       this.lastScheduleHashByPath.set(path, h);
-    } catch { }
+    } catch (e) {
+      console.debug('Failed to compute normalized schedule hash', e);
+    }
     const entries = parseSchedule(content, this.settings.scheduleHeading);
     const hadEntries = entries.length > 0;
 
@@ -146,6 +148,25 @@ export default class ScheduleGCalPlugin extends Plugin {
       return;
     }
 
+    this.updateStatus('Indexing existing events…');
+
+    let existingEvents: GCalEventResponse[] = [];
+    try {
+      existingEvents = await listEventsForDateViaRest(this.settings, this.settings.gcalCalendarId, dateStr);
+    } catch (e) {
+      console.error('Failed to fetch existing events', e);
+    }
+
+    const calendarEventMap = new Map<string, string>();
+    for (const event of existingEvents) {
+      if (event.description) {
+        const keyMatch = event.description.match(/Obsidian-Event-Key:\s*(.+)/);
+        if (keyMatch && event.id) {
+          calendarEventMap.set(keyMatch[1].trim(), event.id);
+        }
+      }
+    }
+
     this.updateStatus('Syncing…');
     const vault = this.app.vault.getName();
     const noteLink = `obsidian://open?vault=${encodeURIComponent(vault)}&file=${encodeURIComponent(path)}`;
@@ -155,13 +176,22 @@ export default class ScheduleGCalPlugin extends Plugin {
       for (const e of entries) {
         const key = makeEventKey(dateStr, e.rawLine);
         currentKeys.add(key);
-        const existingId = this.settings.eventMap[key];
+        
+        const localEventId = this.settings.eventMap[key];
+        const calendarEventId = calendarEventMap.get(key);
+        const existingId = localEventId || calendarEventId;
+        
+        if (calendarEventId && !localEventId) {
+          this.settings.eventMap[key] = calendarEventId;
+        }
+        
         const eventBody = buildEventBody(
           e,
           dateStr,
           this.settings.timeZone,
           noteLink,
-          this.settings.defaultDurationMinutes
+          this.settings.defaultDurationMinutes,
+          key
         );
         try {
           if (existingId) {
@@ -189,8 +219,22 @@ export default class ScheduleGCalPlugin extends Plugin {
 
     let deletedCount = 0;
     const prefix = `${dateStr}::`;
+    
+    const allEventsToCheck = new Map<string, string>();
+
     for (const [key, eventId] of Object.entries(this.settings.eventMap)) {
-      if (!key.startsWith(prefix)) continue;
+      if (key.startsWith(prefix)) {
+        allEventsToCheck.set(key, eventId);
+      }
+    }
+
+    for (const [key, eventId] of calendarEventMap) {
+      if (key.startsWith(prefix) && !allEventsToCheck.has(key)) {
+        allEventsToCheck.set(key, eventId);
+      }
+    }
+    
+    for (const [key, eventId] of allEventsToCheck) {
       if (currentKeys.has(key)) continue;
       try {
         await deleteEventViaClient(this.settings, this.settings.gcalCalendarId, eventId);
@@ -218,13 +262,13 @@ export default class ScheduleGCalPlugin extends Plugin {
         return;
       }
       let totalSynced = 0;
-      let totalDeleted = 0;
+
       for (const f of files) {
         const dateStr = this.dateStrFromDailyFile(f.name);
         if (!dateStr) continue;
-        const beforeDeletes = Object.keys(this.settings.eventMap).length;
+
         await this.syncForPath(f.path, dateStr);
-        const afterDeletes = Object.keys(this.settings.eventMap).length;
+
         totalSynced++;
       }
       new Notice(`Processed ${totalSynced} daily note${totalSynced === 1 ? '' : 's'}`);
@@ -256,7 +300,8 @@ export default class ScheduleGCalPlugin extends Plugin {
     const out: TFile[] = [];
     const stack: (TFolder)[] = [abs];
     while (stack.length) {
-      const current = stack.pop()!;
+      const current = stack.pop();
+      if (!current) break;
       // @ts-ignore Obsidian types: children exists on TFolder
       for (const child of current.children || []) {
         if (child instanceof TFolder) stack.push(child);
@@ -325,21 +370,44 @@ function fixTime(t: string): string {
 }
 
 // ===== Google Calendar API =====
+type GCalEventDate =
+  | { date: string; timeZone: string }
+  | { dateTime: string; timeZone: string };
 
-function buildEventBody(entry: ScheduleEntry, ymd: string, timeZone: string, noteLink: string, defaultDurationMinutes: number) {
+type GCalEventBody = {
+  summary: string;
+  start: GCalEventDate;
+  end: GCalEventDate;
+  description?: string;
+};
+
+type GCalEventResponse = { id: string; description?: string; summary?: string };
+type GCalEventsListResponse = { items?: GCalEventResponse[] };
+type OAuthTokenResponse = { access_token: string; expires_in?: number };
+
+function buildEventBody(
+  entry: ScheduleEntry,
+  ymd: string,
+  timeZone: string,
+  noteLink: string,
+  defaultDurationMinutes: number,
+  eventKey: string
+): GCalEventBody {
+  const baseDescription = `From Obsidian daily note: ${noteLink}\n\nObsidian-Event-Key: ${eventKey}`;
+  
   if (entry.allDay) {
     const endDate = moment(ymd).add(1, 'day').format('YYYY-MM-DD');
     return {
       summary: entry.title,
       start: { date: ymd, timeZone },
       end: { date: endDate, timeZone },
-      description: `From Obsidian daily note: ${noteLink}`,
-    } as any;
+      description: baseDescription,
+    };
   }
 
   const start = entry.start ?? '09:00';
   const startDt = moment(`${ymd} ${start}`, 'YYYY-MM-DD HH:mm');
-  let endDt = entry.end
+  const endDt = entry.end
     ? moment(`${ymd} ${entry.end}`, 'YYYY-MM-DD HH:mm')
     : startDt.clone().add(defaultDurationMinutes, 'minutes');
 
@@ -349,12 +417,11 @@ function buildEventBody(entry: ScheduleEntry, ymd: string, timeZone: string, not
     summary: entry.title,
     start: { dateTime: startLocal, timeZone },
     end: { dateTime: endLocal, timeZone },
-    description: `From Obsidian daily note: ${noteLink}`,
-  } as any;
+    description: baseDescription,
+  };
 }
 
 // ===== REST auth helpers (Service Account JWT) =====
-// Token cache for REST flow
 let mobileTokenCache: { key: string; accessToken: string; expEpoch: number } | null = null;
 
 function authCacheKey(s: ScheduleGCalSettings): string {
@@ -396,7 +463,7 @@ async function importPrivateKeyRS256(pem: string): Promise<CryptoKey> {
   );
 }
 
-async function signJwtRS256(header: Record<string, any>, payload: Record<string, any>, pem: string): Promise<string> {
+async function signJwtRS256(header: Record<string, unknown>, payload: Record<string, unknown>, pem: string): Promise<string> {
   const enc = new TextEncoder();
   const headerB64 = base64UrlEncodeStr(JSON.stringify(header));
   const payloadB64 = base64UrlEncodeStr(JSON.stringify(payload));
@@ -431,57 +498,85 @@ async function getAccessTokenMobile(settings: ScheduleGCalSettings): Promise<str
   const form = new URLSearchParams();
   form.set('grant_type', 'urn:ietf:params:oauth:grant-type:jwt-bearer');
   form.set('assertion', assertion);
-  const resp = await fetch('https://oauth2.googleapis.com/token', {
+  const resp = await requestUrl({
+    url: 'https://oauth2.googleapis.com/token',
     method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    contentType: 'application/x-www-form-urlencoded',
     body: form.toString(),
   });
-  if (!resp.ok) {
-    const txt = await resp.text().catch(() => '');
+  if (resp.status < 200 || resp.status >= 300) {
+    const txt = resp.text || '';
     throw new Error(`Token exchange failed: ${resp.status} ${txt}`);
   }
-  const data = await resp.json();
-  const accessToken = data.access_token as string;
-  const expiresIn = (data.expires_in as number) || 3600;
+  const data = JSON.parse(resp.text) as OAuthTokenResponse;
+  const accessToken = data.access_token;
+  const expiresIn = data.expires_in || 3600;
   mobileTokenCache = { key, accessToken, expEpoch: now + expiresIn };
   return accessToken;
 }
 
-async function gcalFetchMobile(settings: ScheduleGCalSettings, url: string, init: RequestInit): Promise<any> {
+async function gcalFetchMobile(settings: ScheduleGCalSettings, url: string, init: RequestInit): Promise<unknown> {
   const token = await getAccessTokenMobile(settings);
-  const resp = await fetch(url, {
-    ...init,
-    headers: {
-      'Authorization': `Bearer ${token}`,
-      'Content-Type': 'application/json',
-      ...(init.headers || {}),
-    },
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${token}`,
+    'Content-Type': 'application/json',
+  };
+  if (init.headers) {
+    const h = init.headers as HeadersInit;
+    if (Array.isArray(h)) {
+      for (const [k, v] of h) headers[k] = String(v);
+    } else if (h instanceof Headers) {
+      h.forEach((v, k) => {
+        headers[k] = String(v);
+      });
+    } else {
+      Object.assign(headers, h as Record<string, string>);
+    }
+  }
+  const resp = await requestUrl({
+    url,
+    method: (init.method as string) || 'GET',
+    headers,
+    body: (init as { body?: string }).body,
   });
-  if (!resp.ok) {
-    const text = await resp.text().catch(() => '');
+  if (resp.status < 200 || resp.status >= 300) {
+    const text = resp.text || '';
     throw new Error(`GCal REST error ${resp.status}: ${text}`);
   }
   if (resp.status === 204) return undefined;
-  return await resp.json();
+  return resp.text ? JSON.parse(resp.text) : undefined;
 }
 
 async function createEventViaRest(
   settings: ScheduleGCalSettings,
   calendarId: string,
-  body: any,
-) {
+  body: GCalEventBody,
+): Promise<GCalEventResponse> {
   const url = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events`;
-  return await gcalFetchMobile(settings, url, { method: 'POST', body: JSON.stringify(body) });
+  return await gcalFetchMobile(settings, url, { method: 'POST', body: JSON.stringify(body) }) as GCalEventResponse;
 }
 
 async function patchEventViaRest(
   settings: ScheduleGCalSettings,
   calendarId: string,
   eventId: string,
-  body: any,
-) {
+  body: GCalEventBody,
+): Promise<GCalEventResponse> {
   const url = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`;
-  return await gcalFetchMobile(settings, url, { method: 'PATCH', body: JSON.stringify(body) });
+  return await gcalFetchMobile(settings, url, { method: 'PATCH', body: JSON.stringify(body) }) as GCalEventResponse;
+}
+
+async function listEventsForDateViaRest(
+  settings: ScheduleGCalSettings,
+  calendarId: string,
+  dateStr: string
+): Promise<GCalEventResponse[]> {
+  const timeMin = `${dateStr}T00:00:00Z`;
+  const timeMax = moment(dateStr).add(1, 'day').format('YYYY-MM-DD') + 'T00:00:00Z';
+  const url = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events?timeMin=${encodeURIComponent(timeMin)}&timeMax=${encodeURIComponent(timeMax)}&singleEvents=true`;
+  
+  const result = await gcalFetchMobile(settings, url, { method: 'GET' }) as GCalEventsListResponse;
+  return result.items || [];
 }
 
 async function deleteEventViaRest(
@@ -491,14 +586,15 @@ async function deleteEventViaRest(
 ): Promise<void> {
   const url = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`;
   const token = await getAccessTokenMobile(settings);
-  const resp = await fetch(url, {
+  const resp = await requestUrl({
+    url,
     method: 'DELETE',
-    headers: { 'Authorization': `Bearer ${token}` },
+    headers: { Authorization: `Bearer ${token}` },
   });
-  if (resp.ok || resp.status === 204 || resp.status === 404 || resp.status === 410) {
+  if ((resp.status >= 200 && resp.status < 300) || resp.status === 204 || resp.status === 404 || resp.status === 410) {
     return;
   }
-  const text = await resp.text().catch(() => '');
+  const text = resp.text || '';
   throw new Error(`GCal REST error ${resp.status}: ${text}`);
 }
 
@@ -506,8 +602,8 @@ async function deleteEventViaRest(
 async function createEventViaClient(
   settings: ScheduleGCalSettings,
   calendarId: string,
-  body: any
-) {
+  body: GCalEventBody
+): Promise<GCalEventResponse> {
   return await createEventViaRest(settings, calendarId, body);
 }
 
@@ -515,8 +611,8 @@ async function patchEventViaClient(
   settings: ScheduleGCalSettings,
   calendarId: string,
   eventId: string,
-  body: any
-) {
+  body: GCalEventBody
+): Promise<GCalEventResponse> {
   return await patchEventViaRest(settings, calendarId, eventId, body);
 }
 
@@ -601,7 +697,7 @@ class ScheduleGCalSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName('Service Account Private Key (PEM)')
       .setDesc('Paste the full PEM, including -----BEGIN PRIVATE KEY----- / -----END PRIVATE KEY-----')
-      .addTextArea?.((ta: any) => {
+      .addTextArea?.((ta: TextAreaComponent) => {
         ta.setPlaceholder('-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgkq...\n-----END PRIVATE KEY-----')
           .setValue(this.plugin.settings.saPrivateKey)
           .onChange(async (v: string) => {
