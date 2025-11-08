@@ -221,7 +221,6 @@ export default class ScheduleGCalPlugin extends Plugin {
       }
     }
 
-    let deletedCount = 0;
     const prefix = `${dateStr}::`;
     
     const allEventsToCheck = new Map<string, string>();
@@ -243,7 +242,6 @@ export default class ScheduleGCalPlugin extends Plugin {
       try {
         await deleteEventViaClient(this.settings, this.settings.gcalCalendarId, eventId);
         delete this.settings.eventMap[key];
-        deletedCount++;
       } catch (err) {
         console.error('Delete event failed', key, eventId, err);
       }
