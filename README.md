@@ -1,4 +1,4 @@
-# Obsidian Daily to Calendar
+# Daily to Calendar
 
  [Русская версия README](./README.ru.md)
 

@@ -1,6 +1,8 @@
-import { App, Notice, Plugin, PluginSettingTab, Setting, TFile, TFolder, moment, requestUrl, TextAreaComponent } from 'obsidian';
+import { App, Notice, Plugin, PluginSettingTab, Setting, TFile, TFolder, moment, requestUrl, TextAreaComponent, normalizePath, AbstractInputSuggest } from 'obsidian';
 
 import { DEFAULT_SETTINGS, ScheduleGCalSettings } from 'src/settings';
+
+import '../styles.css';
 
 
 export default class ScheduleGCalPlugin extends Plugin {
@@ -19,14 +21,14 @@ export default class ScheduleGCalPlugin extends Plugin {
     });
     ribbon.addClass('schedule-gcal-ribbon');
 
-    const ribbonAll = this.addRibbonIcon('calendar', 'Sync ALL daily notes to Google Calendar', async () => {
+    const ribbonAll = this.addRibbonIcon('calendar', 'Sync all daily notes to Google Calendar', async () => {
       await this.syncAllDailyNotes();
     });
     ribbonAll.addClass('schedule-gcal-ribbon-all');
 
     this.addCommand({
       id: 'sync-today-schedule-to-google-calendar',
-      name: "Sync Today's Schedule to Google Calendar",
+      name: "Sync today's schedule to Google Calendar",
       callback: async () => {
         await this.syncToday();
       },
@@ -34,7 +36,7 @@ export default class ScheduleGCalPlugin extends Plugin {
 
     this.addCommand({
       id: 'sync-all-dailies-to-google-calendar',
-      name: 'Sync ALL Daily Notes to Google Calendar',
+      name: 'Sync all daily notes to Google Calendar',
       callback: async () => {
         await this.syncAllDailyNotes();
       },
@@ -63,19 +65,21 @@ export default class ScheduleGCalPlugin extends Plugin {
       })
     );
 
-    if (this.settings.autoSyncOnModify) {
-      const dailyFiles = this.getDailyFiles();
-      for (const f of dailyFiles) {
-        try {
-          const content = await this.app.vault.read(f);
-          const normalized = extractScheduleNormalized(content, this.settings.scheduleHeading);
-          const h = simpleHash(normalized);
-          this.lastScheduleHashByPath.set(f.path, h);
-        } catch (e) {
-          console.debug('Failed to prime schedule hash cache', f.path, e);
+    this.app.workspace.onLayoutReady(async () => {
+      if (this.settings.autoSyncOnModify) {
+        const dailyFiles = this.getDailyFiles();
+        for (const f of dailyFiles) {
+          try {
+            const content = await this.app.vault.cachedRead(f);
+            const normalized = extractScheduleNormalized(content, this.settings.scheduleHeading);
+            const h = simpleHash(normalized);
+            this.lastScheduleHashByPath.set(f.path, h);
+          } catch (e) {
+            console.debug('Failed to prime schedule hash cache', f.path, e);
+          }
         }
       }
-    }
+    });
 
     this.addSettingTab(new ScheduleGCalSettingTab(this.app, this));
   }
@@ -97,7 +101,7 @@ export default class ScheduleGCalPlugin extends Plugin {
   getTodayNotePath(): string | null {
     const fileNameBase = moment().format(this.settings.dailyFilenameFormat);
     const fileName = fileNameBase.endsWith('.md') ? fileNameBase : `${fileNameBase}.md`;
-    const folder = this.settings.dailyFolder?.replace(/^\/+|\/+$/g, '');
+    const folder = normalizePath(this.settings.dailyFolder || '');
     const path = folder ? `${folder}/${fileName}` : fileName;
     const file = this.app.vault.getAbstractFileByPath(path);
     return file instanceof TFile ? file.path : null;
@@ -247,11 +251,6 @@ export default class ScheduleGCalPlugin extends Plugin {
 
     await this.saveSettings();
     this.updateStatus('Done');
-    if (hadEntries) {
-      new Notice(`Synced ${entries.length} schedule entr${entries.length === 1 ? 'y' : 'ies'} for ${dateStr}${deletedCount ? `, removed ${deletedCount}` : ''}`);
-    } else {
-      if (deletedCount) new Notice(`Removed ${deletedCount} events for ${dateStr}`);
-    }
   }
 
   async syncAllDailyNotes() {
@@ -667,6 +666,33 @@ function simpleHash(input: string): string {
 }
 
 // ===== Settings UI =====
+class FolderSuggest extends AbstractInputSuggest<TFolder> {
+  getSuggestions(inputStr: string): TFolder[] {
+    const abstractFiles = this.app.vault.getAllLoadedFiles();
+    const folders: TFolder[] = [];
+    const lowerCaseInputStr = inputStr.toLowerCase();
+
+    abstractFiles.forEach((folder: TFolder) => {
+      if (
+        folder instanceof TFolder &&
+        folder.path.toLowerCase().contains(lowerCaseInputStr)
+      ) {
+        folders.push(folder);
+      }
+    });
+
+    return folders;
+  }
+
+  renderSuggestion(folder: TFolder, el: HTMLElement): void {
+    el.setText(folder.path);
+  }
+
+  selectSuggestion(folder: TFolder): void {
+    this.setValue(folder.path);
+  }
+}
+
 class ScheduleGCalSettingTab extends PluginSettingTab {
   plugin: ScheduleGCalPlugin;
   constructor(app: App, plugin: ScheduleGCalPlugin) {
@@ -677,13 +703,15 @@ class ScheduleGCalSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
 
-    containerEl.createEl('h2', { text: 'Daily Schedule → Google Calendar' });
+    new Setting(containerEl)
+      .setName('Authentication')
+      .setHeading();
 
     const saHelp = containerEl.createEl('div');
-    saHelp.setAttr('style', 'font-size: 13px; font-weight: 600; color: var(--text-accent); padding: 8px 10px; border-left: 3px solid var(--interactive-accent); border-radius: 4px; margin-top: 8px;');
+    saHelp.addClass('sa-help');
     saHelp.setText('Tip: Share the target calendar with the service account email with at least "Make changes to events".');
     new Setting(containerEl)
-      .setName('Service Account Client Email')
+      .setName('Service account client email')
       .setDesc('From the JSON key: client_email')
       .addText((t) =>
         t.setPlaceholder('service-account@project.iam.gserviceaccount.com')
@@ -695,7 +723,7 @@ class ScheduleGCalSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName('Service Account Private Key (PEM)')
+      .setName('Service account private key (PEM)')
       .setDesc('Paste the full PEM, including -----BEGIN PRIVATE KEY----- / -----END PRIVATE KEY-----')
       .addTextArea?.((ta: TextAreaComponent) => {
         ta.setPlaceholder('-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgkq...\n-----END PRIVATE KEY-----')
@@ -708,7 +736,7 @@ class ScheduleGCalSettingTab extends PluginSettingTab {
         ta.inputEl.cols = 60;
       })
     new Setting(containerEl)
-      .setName('(Fallback) SA Private Key')
+      .setName('(Fallback) Service account private key')
       .setDesc('If no textarea shown above, paste PEM in one line with \n escapes')
       .addText((t) =>
         t.setPlaceholder('-----BEGIN PRIVATE KEY-----\\n...')
@@ -718,8 +746,6 @@ class ScheduleGCalSettingTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           })
       );
-
-
 
     new Setting(containerEl)
       .setName('Calendar ID')
@@ -734,22 +760,27 @@ class ScheduleGCalSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
+      .setName('Daily notes')
+      .setHeading();
+
+    new Setting(containerEl)
       .setName('Daily notes folder')
       .setDesc('Folder containing daily notes')
-      .addText((t) =>
+      .addText((t) => {
+        new FolderSuggest(this.app, t.inputEl);
         t.setPlaceholder('Daily')
           .setValue(this.plugin.settings.dailyFolder)
           .onChange(async (v) => {
             this.plugin.settings.dailyFolder = v.trim();
             await this.plugin.saveSettings();
-          })
-      );
+          });
+      });
 
     new Setting(containerEl)
       .setName('Daily filename format')
-      .setDesc("moment.js format without extension, e.g., 'YYYY-MM-DD'")
-      .addText((t) =>
-        t.setPlaceholder('YYYY-MM-DD')
+      .setDesc("Moment.js format without extension, e.g., 'YYYY-MM-DD'")
+      .addMomentFormat((mf) =>
+        mf.setPlaceholder('YYYY-MM-DD')
           .setValue(this.plugin.settings.dailyFilenameFormat)
           .onChange(async (v) => {
             this.plugin.settings.dailyFilenameFormat = v.trim() || 'YYYY-MM-DD';
@@ -818,10 +849,10 @@ class ScheduleGCalSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName('Sync ALL daily notes now')
+      .setName('Sync all daily notes now')
       .setDesc('Sync schedule sections in all daily notes in the configured folder')
       .addButton((b) =>
-        b.setButtonText('Sync All')
+        b.setButtonText('Sync all')
           .onClick(async () => {
             await this.plugin.syncAllDailyNotes();
           })

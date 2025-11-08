@@ -1,0 +1,9 @@
+.sa-help {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-accent);
+  padding: 8px 10px;
+  border-left: 3px solid var(--interactive-accent);
+  border-radius: 4px;
+  margin-top: 8px;
+}
