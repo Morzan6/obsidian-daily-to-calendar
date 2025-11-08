@@ -3,7 +3,7 @@
 	"name": "Daily to Calendar",
 	"version": "1.1.2",
 	"minAppVersion": "0.15.0",
-	"description": "Sync daily notes schedule with Google Calendar",
+	"description": "Sync daily notes schedule with Google Calendar.",
 	"author": "Morzan6",
 	"authorUrl": "https://github.com/Morzan6",
 	"isDesktopOnly": false
