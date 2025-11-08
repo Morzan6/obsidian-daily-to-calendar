@@ -179,4 +179,4 @@ npm run dev
 ---
 
 **Автор**: Morzan6 (n.kusmaul@yandex.ru)  
-**Версия**: 1.1.1
+**Версия**: 1.1.2
